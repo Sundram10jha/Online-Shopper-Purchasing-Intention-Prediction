@@ -1,0 +1,644 @@
+Love that you’re honest about being a noob 🙂
+I’ll treat this like we’re pair-programming and you’re doing this **first time**.
+
+We’ll do 3 things:
+
+1. **Understand the data model and keys** (in simple words)
+2. **Create 5 mock tables with ~200 rows each** (using Python + BigQuery)
+3. **Build a Dataflow (Apache Beam, Python) pipeline** that joins those 5 tables into **one single view**.
+
+I’ll keep everything step-by-step and runnable.
+
+---
+
+## 0. Big picture in plain English
+
+We’re doing this only for **one product: VNP** (Vision+ cards).
+
+### Tables you will have (5)
+
+All will be in BigQuery, in one dataset, e.g. `merge_match_dev`.
+
+1. **`vnp_accounts_mock`** – COG account table (one row per account)
+2. **`credit_facility_mock`** – main BOLT facility info (one row per facility instance)
+3. **`mapped_facility_mock`** – tells which source system a facility came from
+4. **`fulfilled_account_mock`** – links a facility instance to an account id
+5. **`facility_purpose_mock`** – describes why the facility exists (purpose text)
+
+### Core keys
+
+* `ACCOUNT_NUMBER` – account identifier in COG
+* `fulfilledAccountId` – account identifier in FulfilledAccount
+* `facilityInstanceId` – main facility key across facility tables
+
+**Join chain:**
+
+```text
+COG VNP account (ACCOUNT_NUMBER)
+   ↕ (matches)
+FulfilledAccount.fulfilledAccountId
+   ↕ facilityInstanceId
+CreditFacility.facilityInstanceId
+   ↕ facilityInstanceId
+MappedFacility + FacilityPurpose
+```
+
+Dataflow job will:
+
+1. Read all 5 tables
+2. Join them using these keys
+3. Produce a new table: **`vnp_account_facility_single_view`**
+
+---
+
+## 1. Step 1 – Create BigQuery dataset & empty tables
+
+### 1.1 Create dataset (one-time)
+
+In BigQuery UI (console):
+
+* Click your project
+* “**Create dataset**” → name: `merge_match_dev`
+
+Or with SQL:
+
+```sql
+CREATE SCHEMA `PROJECT_ID.merge_match_dev`;
+```
+
+Replace `PROJECT_ID` with your GCP project id.
+
+### 1.2 Create table schemas
+
+Run these **one by one** in BigQuery SQL editor.
+
+#### a) VNP accounts mock
+
+```sql
+CREATE TABLE `PROJECT_ID.merge_match_dev.vnp_accounts_mock` (
+  SOURCE_SYSTEM_ID INT64,
+  EXTERNAL_SYSTEM_NAME STRING,
+  ACCOUNT_CODE STRING,
+  SORT_CODE STRING,
+  ACCOUNT_NUMBER STRING,
+  ACCOUNT_NAME STRING,
+  ACCOUNT_OPEN_DATE STRING,
+  ACCOUNT_CLOSE_DATE STRING,
+  ACCOUNT_BALANCE NUMERIC,
+  CURRENCY_CODE STRING,
+  LIMIT NUMERIC,
+  HERITAGE_TYPE_ID INT64,
+  DATE_ENDED STRING,
+  INITIAL_POPULATION_TS DATETIME,
+  BUSINESS_DATE_EXT STRING,
+  UPDATE_DATE_TIME DATETIME,
+  FACILITYMAPPINGKEY STRING,
+  SYSTEMTABLEID INT64,
+  SOURCE_HERITAGE_CODE STRING,
+  PAYMENT_DATE STRING,
+  DATE_LAST_MISSED_PAYMENT STRING,
+  PAYMENT_AMOUNT NUMERIC,
+  BLOCK_CODE_1 STRING,
+  BLOCK_CODE_2 STRING,
+  ARREARS_AMOUNT NUMERIC,
+  DAYS_PAST_DUE_COUNT INT64,
+  CONDITION_OF_ACCOUNT INT64,
+  DATE_LAST_CREDIT STRING,
+  DATE_CARD_EXPR STRING,
+  RAW_INGESTION_TIME TIMESTAMP,
+  STAGING_INGESTION_TIME TIMESTAMP,
+  VALIDATION_REASON STRING,
+  VALIDATION_STATUS STRING,
+  LOAD_DATE DATE
+);
+```
+
+#### b) Credit facility
+
+```sql
+CREATE TABLE `PROJECT_ID.merge_match_dev.credit_facility_mock` (
+  facilityId INT64,
+  facilityInstanceId INT64,
+  customerId INT64,
+  proposalId STRING,
+  typeOfCommitment STRING,
+  productGroupId STRING,
+  productName STRING,
+  productId STRING,
+  purpose STRING,
+  facilityStage STRING,
+  requestedFacilityLimit NUMERIC,
+  existingSanctionedLimit NUMERIC,
+  createdDate DATETIME,
+  updatedDate DATETIME
+);
+```
+
+#### c) Mapped facility
+
+```sql
+CREATE TABLE `PROJECT_ID.merge_match_dev.mapped_facility_mock` (
+  facilityInstanceId INT64,
+  sourceSystemName STRING,
+  facilityId STRING,
+  createdDate DATETIME,
+  updatedDate DATETIME
+);
+```
+
+#### d) Fulfilled account
+
+```sql
+CREATE TABLE `PROJECT_ID.merge_match_dev.fulfilled_account_mock` (
+  facilityInstanceId INT64,
+  fulfilledAccountId STRING,
+  createdDate DATETIME,
+  updatedDate DATETIME
+);
+```
+
+#### e) Facility purpose
+
+```sql
+CREATE TABLE `PROJECT_ID.merge_match_dev.facility_purpose_mock` (
+  facilityInstanceId INT64,
+  purpose STRING,
+  createdDate DATETIME,
+  updatedDate DATETIME
+);
+```
+
+✅ Now you have 5 **empty** tables.
+
+---
+
+## 2. Step 2 – Generate ~200 mock rows (with Python)
+
+You **don’t** want to manually type 200 rows.
+We’ll write a small Python script that:
+
+* creates 200 rows per table
+* writes them to CSVs
+* you then load those CSVs into BigQuery with UI (simple for a beginner)
+
+### 2.1 Python script to generate CSV files
+
+Create a file: `generate_mock_vnp_data.py`
+
+```python
+import csv
+from datetime import datetime, date, timedelta
+import random
+
+NUM_ROWS = 200
+
+def gen_accounts():
+    with open("vnp_accounts_mock.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "SOURCE_SYSTEM_ID","EXTERNAL_SYSTEM_NAME","ACCOUNT_CODE","SORT_CODE",
+            "ACCOUNT_NUMBER","ACCOUNT_NAME","ACCOUNT_OPEN_DATE","ACCOUNT_CLOSE_DATE",
+            "ACCOUNT_BALANCE","CURRENCY_CODE","LIMIT","HERITAGE_TYPE_ID","DATE_ENDED",
+            "INITIAL_POPULATION_TS","BUSINESS_DATE_EXT","UPDATE_DATE_TIME",
+            "FACILITYMAPPINGKEY","SYSTEMTABLEID","SOURCE_HERITAGE_CODE",
+            "PAYMENT_DATE","DATE_LAST_MISSED_PAYMENT","PAYMENT_AMOUNT",
+            "BLOCK_CODE_1","BLOCK_CODE_2","ARREARS_AMOUNT","DAYS_PAST_DUE_COUNT",
+            "CONDITION_OF_ACCOUNT","DATE_LAST_CREDIT","DATE_CARD_EXPR",
+            "RAW_INGESTION_TIME","STAGING_INGESTION_TIME","VALIDATION_REASON",
+            "VALIDATION_STATUS","LOAD_DATE"
+        ])
+        base_date = date(2015,1,1)
+        for i in range(1, NUM_ROWS+1):
+            acc_num = f"1000{i:05d}"
+            open_d = base_date + timedelta(days=random.randint(0, 2000))
+            writer.writerow([
+                55,
+                "VNP",
+                f"AC{i:05d}",
+                "00-11-22",
+                acc_num,
+                f"Customer {i}",
+                open_d.isoformat(),
+                "9999-01-01",
+                round(random.uniform(-100, 3000), 2),
+                "GBP",
+                round(random.uniform(500, 5000), 2),
+                1,
+                "9999-01-01",
+                datetime.utcnow().isoformat(timespec="seconds"),
+                open_d.isoformat(),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                f"{1000 + (i % NUM_ROWS)}",   # simple mapping key
+                101,
+                "VNP",
+                open_d.isoformat(),
+                "",
+                round(random.uniform(0, 500), 2),
+                "",
+                "",
+                round(random.uniform(0, 500), 2),
+                random.randint(0, 60),
+                1,
+                open_d.isoformat(),
+                "2030-12-31",
+                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                "",
+                "PASSED",
+                date.today().isoformat()
+            ])
+
+def gen_facilities():
+    with open("credit_facility_mock.csv","w",newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "facilityId","facilityInstanceId","customerId","proposalId",
+            "typeOfCommitment","productGroupId","productName","productId",
+            "purpose","facilityStage","requestedFacilityLimit",
+            "existingSanctionedLimit","createdDate","updatedDate"
+        ])
+        for i in range(1, NUM_ROWS+1):
+            facility_id = i
+            inst_id = 1000 + i
+            writer.writerow([
+                facility_id,
+                inst_id,
+                100000 + i,
+                f"PRO-{i:06d}",
+                random.choice(["HARD","SOFT","INTERNAL"]),
+                "PG4",                      # cards
+                "Vision+ Credit Card",
+                "VNP_CARD",
+                random.choice([
+                    "Day to Day Cash Flow",
+                    "To Purchase Equipment",
+                    "Pay VAT Bill",
+                    "Property Development"
+                ]),
+                random.choice(["WIP","Sanctioned","Fulfilled"]),
+                round(random.uniform(1000, 10000),2),
+                round(random.uniform(500, 9000),2),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ])
+
+def gen_mapped_facility():
+    with open("mapped_facility_mock.csv","w",newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "facilityInstanceId","sourceSystemName","facilityId",
+            "createdDate","updatedDate"
+        ])
+        for i in range(1, NUM_ROWS+1):
+            inst_id = 1000 + i
+            writer.writerow([
+                inst_id,
+                "BOLT",
+                f"BOLT-FAC-{i:06d}",
+                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ])
+
+def gen_fulfilled_account():
+    with open("fulfilled_account_mock.csv","w",newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "facilityInstanceId","fulfilledAccountId",
+            "createdDate","updatedDate"
+        ])
+        for i in range(1, NUM_ROWS+1):
+            inst_id = 1000 + i
+            acc_num = f"1000{i:05d}"   # matches ACCOUNT_NUMBER pattern
+            writer.writerow([
+                inst_id,
+                acc_num,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ])
+
+def gen_facility_purpose():
+    with open("facility_purpose_mock.csv","w",newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "facilityInstanceId","purpose","createdDate","updatedDate"
+        ])
+        for i in range(1, NUM_ROWS+1):
+            inst_id = 1000 + i
+            writer.writerow([
+                inst_id,
+                random.choice([
+                    "Day to Day Cash Flow",
+                    "To Purchase Equipment",
+                    "Pay VAT Bill",
+                    "Property Development"
+                ]),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ])
+
+if __name__ == "__main__":
+    gen_accounts()
+    gen_facilities()
+    gen_mapped_facility()
+    gen_fulfilled_account()
+    gen_facility_purpose()
+    print("CSV files generated.")
+```
+
+Run it (locally or in Cloud Shell):
+
+```bash
+python generate_mock_vnp_data.py
+```
+
+You’ll get 5 CSV files in the same folder, each with **200 rows**.
+
+### 2.2 Load CSVs into BigQuery
+
+In BigQuery UI, for each table:
+
+1. Click the table name (e.g. `vnp_accounts_mock`)
+2. “**Upload data**” → “Upload”
+3. Select the CSV file
+4. File format: CSV
+5. Schema: **use existing table**
+6. Load
+
+Repeat for all 5 tables.
+
+Now your mock data is ready 🎉
+
+---
+
+## 3. Step 3 – Dataflow / Apache Beam pipeline (Python)
+
+Now the fun part: **joining these 5 tables using Beam**.
+
+High level:
+
+1. Read from BigQuery: 5 PCollections
+2. Convert each into key/value pairs:
+
+   * accounts keyed by `ACCOUNT_NUMBER`
+   * fulfilled accounts keyed by `fulfilledAccountId`
+   * facilities keyed by `facilityInstanceId`
+   * mapped_facility keyed by `facilityInstanceId`
+   * facility_purpose keyed by `facilityInstanceId`
+3. Join accounts ↔ fulfilled accounts using `CoGroupByKey`
+4. For each matched account/facilityInstanceId, join to facility + mapping + purpose.
+5. Write final rows to a BigQuery table `vnp_account_facility_single_view`.
+
+### 3.1 Install Apache Beam locally (for dev)
+
+```bash
+pip install apache-beam[gcp]
+```
+
+### 3.2 Beam pipeline code (simplified but working)
+
+Create file: `vnp_merge_match_pipeline.py`
+
+```python
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, GoogleCloudOptions, StandardOptions
+
+PROJECT = "PROJECT_ID"
+DATASET = "merge_match_dev"
+REGION = "europe-west2"  # or your region
+TEMP_LOCATION = "gs://YOUR_BUCKET/temp"
+JOB_NAME = "vnp-merge-match"
+
+class MakeKV(beam.DoFn):
+    def __init__(self, key_field):
+        self.key_field = key_field
+
+    def process(self, element):
+        key = element[self.key_field]
+        yield (key, element)
+
+def run(argv=None):
+    options = PipelineOptions(argv)
+    gcloud_options = options.view_as(GoogleCloudOptions)
+    gcloud_options.project = PROJECT
+    gcloud_options.region = REGION
+    gcloud_options.job_name = JOB_NAME
+    gcloud_options.temp_location = TEMP_LOCATION
+
+    options.view_as(StandardOptions).runner = 'DataflowRunner'   # or 'DirectRunner' for local tests
+
+    with beam.Pipeline(options=options) as p:
+
+        # 1. Read from BigQuery
+        accounts = (
+            p
+            | "ReadAccounts" >> beam.io.ReadFromBigQuery(
+                table=f"{PROJECT}:{DATASET}.vnp_accounts_mock")
+            | "AccountKV" >> beam.ParDo(MakeKV("ACCOUNT_NUMBER"))
+        )
+
+        fulfilled = (
+            p
+            | "ReadFulfilled" >> beam.io.ReadFromBigQuery(
+                table=f"{PROJECT}:{DATASET}.fulfilled_account_mock")
+            | "FulfilledKV" >> beam.ParDo(MakeKV("fulfilledAccountId"))
+        )
+
+        facilities = (
+            p
+            | "ReadFacilities" >> beam.io.ReadFromBigQuery(
+                table=f"{PROJECT}:{DATASET}.credit_facility_mock")
+            | "FacilityKV" >> beam.ParDo(MakeKV("facilityInstanceId"))
+        )
+
+        mapped = (
+            p
+            | "ReadMapped" >> beam.io.ReadFromBigQuery(
+                table=f"{PROJECT}:{DATASET}.mapped_facility_mock")
+            | "MappedKV" >> beam.ParDo(MakeKV("facilityInstanceId"))
+        )
+
+        purposes = (
+            p
+            | "ReadPurpose" >> beam.io.ReadFromBigQuery(
+                table=f"{PROJECT}:{DATASET}.facility_purpose_mock")
+            | "PurposeKV" >> beam.ParDo(MakeKV("facilityInstanceId"))
+        )
+
+        # 2. Join accounts ↔ fulfilled accounts on account number
+        accounts_and_fulfilled = (
+            {"acct": accounts, "fa": fulfilled}
+            | "JoinAccountFulfilled" >> beam.CoGroupByKey()
+        )
+
+        # 3. Convert that into keyed by facilityInstanceId
+        #    (one account can connect to 0/1 facilityInstanceIds via fulfilled)
+        def expand_account_facility(kv):
+            acct_number, groups = kv
+            acct_rows = groups["acct"]
+            fa_rows = groups["fa"]
+            for acct in acct_rows:
+                if fa_rows:
+                    for fa in fa_rows:
+                        yield (fa["facilityInstanceId"], {"account": acct, "fa": fa})
+                else:
+                    # account with no fulfilled facility → you can ignore or output unmatched
+                    pass
+
+        acct_by_facility = accounts_and_fulfilled | "AccountByFacility" >> beam.FlatMap(expand_account_facility)
+
+        # 4. Join facilityInstanceId with facilities, mapped, purposes
+        joined_facility_side = (
+            {"acct": acct_by_facility,
+             "facility": facilities,
+             "mapped": mapped,
+             "purpose": purposes}
+            | "JoinFacilityAll" >> beam.CoGroupByKey()
+        )
+
+        # 5. Build final single-view records
+        def build_single_view(kv):
+            facility_instance_id, groups = kv
+
+            acct_entries = groups["acct"]
+            facility_rows = groups["facility"]
+            mapped_rows = groups["mapped"]
+            purpose_rows = groups["purpose"]
+
+            if not acct_entries or not facility_rows:
+                return  # skip incomplete records in this simple POC
+
+            acct = acct_entries[0]["account"]
+            fa = acct_entries[0]["fa"]
+            facility = facility_rows[0]
+            mapped = mapped_rows[0] if mapped_rows else {}
+            # can be multiple purposes; join with '; '
+            purposes = "; ".join([p["purpose"] for p in purpose_rows]) if purpose_rows else None
+
+            yield {
+                "ACCOUNT_NUMBER": acct["ACCOUNT_NUMBER"],
+                "ACCOUNT_CODE": acct["ACCOUNT_CODE"],
+                "ACCOUNT_NAME": acct["ACCOUNT_NAME"],
+                "ACCOUNT_BALANCE": acct["ACCOUNT_BALANCE"],
+                "ACCOUNT_LIMIT": acct["LIMIT"],
+                "CURRENCY_CODE": acct["CURRENCY_CODE"],
+                "SOURCE_SYSTEM_ID": acct["SOURCE_SYSTEM_ID"],
+                "EXTERNAL_SYSTEM_NAME": acct["EXTERNAL_SYSTEM_NAME"],
+                "LOAD_DATE": acct["LOAD_DATE"].isoformat() if hasattr(acct["LOAD_DATE"], "isoformat") else str(acct["LOAD_DATE"]),
+
+                "facilityId": facility["facilityId"],
+                "facilityInstanceId": facility["facilityInstanceId"],
+                "customerId": facility["customerId"],
+                "proposalId": facility["proposalId"],
+                "typeOfCommitment": facility["typeOfCommitment"],
+                "productGroupId": facility["productGroupId"],
+                "productName": facility["productName"],
+                "productId": facility["productId"],
+                "facilityStage": facility["facilityStage"],
+                "requestedFacilityLimit": facility["requestedFacilityLimit"],
+                "existingSanctionedLimit": facility["existingSanctionedLimit"],
+                "facilityCreatedDate": facility["createdDate"],
+                "facilityUpdatedDate": facility["updatedDate"],
+
+                "sourceSystemName": mapped.get("sourceSystemName"),
+                "sourceFacilityId": mapped.get("facilityId"),
+                "purposes": purposes,
+
+                "fulfilledAccountId": fa["fulfilledAccountId"]
+            }
+
+        single_view = joined_facility_side | "BuildSingleView" >> beam.FlatMap(build_single_view)
+
+        # 6. Write to BigQuery
+        single_view | "WriteSingleView" >> beam.io.WriteToBigQuery(
+            table=f"{PROJECT}:{DATASET}.vnp_account_facility_single_view",
+            schema={
+                "fields": [
+                    {"name": "ACCOUNT_NUMBER", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "ACCOUNT_CODE", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "ACCOUNT_NAME", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "ACCOUNT_BALANCE", "type": "NUMERIC", "mode": "NULLABLE"},
+                    {"name": "ACCOUNT_LIMIT", "type": "NUMERIC", "mode": "NULLABLE"},
+                    {"name": "CURRENCY_CODE", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "SOURCE_SYSTEM_ID", "type": "INTEGER", "mode": "NULLABLE"},
+                    {"name": "EXTERNAL_SYSTEM_NAME", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "LOAD_DATE", "type": "DATE", "mode": "NULLABLE"},
+
+                    {"name": "facilityId", "type": "INTEGER", "mode": "NULLABLE"},
+                    {"name": "facilityInstanceId", "type": "INTEGER", "mode": "NULLABLE"},
+                    {"name": "customerId", "type": "INTEGER", "mode": "NULLABLE"},
+                    {"name": "proposalId", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "typeOfCommitment", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "productGroupId", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "productName", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "productId", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "facilityStage", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "requestedFacilityLimit", "type": "NUMERIC", "mode": "NULLABLE"},
+                    {"name": "existingSanctionedLimit", "type": "NUMERIC", "mode": "NULLABLE"},
+                    {"name": "facilityCreatedDate", "type": "DATETIME", "mode": "NULLABLE"},
+                    {"name": "facilityUpdatedDate", "type": "DATETIME", "mode": "NULLABLE"},
+
+                    {"name": "sourceSystemName", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "sourceFacilityId", "type": "STRING", "mode": "NULLABLE"},
+                    {"name": "purposes", "type": "STRING", "mode": "NULLABLE"},
+
+                    {"name": "fulfilledAccountId", "type": "STRING", "mode": "NULLABLE"}
+                ]
+            },
+            write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+        )
+
+if __name__ == "__main__":
+    run()
+```
+
+### 3.3 Running the pipeline
+
+**Local test (small data, DirectRunner):**
+
+Change:
+
+```python
+options.view_as(StandardOptions).runner = 'DataflowRunner'
+```
+
+to `'DirectRunner'`.
+
+Then run:
+
+```bash
+python vnp_merge_match_pipeline.py
+```
+
+Check BigQuery table:
+
+`merge_match_dev.vnp_account_facility_single_view`
+
+If it looks good, switch back to `'DataflowRunner'` and run on GCP:
+
+```bash
+python vnp_merge_match_pipeline.py \
+  --project=PROJECT_ID \
+  --region=REGION \
+  --temp_location=gs://YOUR_BUCKET/temp
+```
+
+(Or you can start it from Cloud Shell.)
+
+---
+
+## 4. What you’ll have at the end
+
+* 5 mock tables with 200 rows each
+* A **Dataflow job** that joins them correctly
+* One final table **`vnp_account_facility_single_view`** that you can show to your manager as:
+
+> “This is the working prototype of the Merge & Match solution for VNP using Dataflow. Next step is to extend it to other source systems and tune matching rules.”
+
+---
+
+If you want, next I can:
+
+* Simplify the Beam code even more and add comments line-by-line, or
+* Help you design **metrics** (match rate, unmatched accounts) in Dataflow, or
+* Draft a **Jira comment / demo script** you can use when you show this to your manager.
